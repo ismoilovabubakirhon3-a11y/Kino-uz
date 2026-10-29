@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Final
+from urllib.parse import urlsplit
 
-from telegram import Update
-from telegram.error import TelegramError
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -21,198 +21,368 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# HTTP request logs can contain Telegram API URLs, so keep them out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CATALOG_FILE = "catalog.json"
 
-def load_catalog() -> dict[str, dict[str, str]]:
-    """Load movie catalog from JSON file."""
-    if os.path.exists(CATALOG_FILE):
-        try:
-            with open(CATALOG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            logger.exception("Could not load catalog file")
-    return {}
 
-def save_catalog(catalog: dict[str, dict[str, str]]) -> None:
-    """Save movie catalog to JSON file."""
+def load_catalog() -> dict[str, object]:
+    """Load the catalog, keeping older string entries compatible."""
     try:
-        with open(CATALOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(catalog, f, ensure_ascii=False, indent=4)
-    except Exception:
-        logger.exception("Could not save catalog file")
+        with open(CATALOG_FILE, "r", encoding="utf-8") as catalog_file:
+            catalog = json.load(catalog_file)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        logger.exception("Could not load catalog file")
+        raise
 
-# Initialize catalog
-MOVIE_CATALOG: dict[str, dict[str, str]] = load_catalog()
+    if not isinstance(catalog, dict):
+        raise ValueError("Catalog must be a JSON object")
+    return catalog
+
+
+def save_catalog(catalog: dict[str, object]) -> None:
+    """Atomically save the catalog to disk."""
+    temp_file = f"{CATALOG_FILE}.tmp"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as catalog_file:
+            json.dump(catalog, catalog_file, ensure_ascii=False, indent=2)
+        os.replace(temp_file, CATALOG_FILE)
+    except OSError:
+        logger.exception("Could not save catalog file")
+        try:
+            os.remove(temp_file)
+        except OSError:
+            pass
+        raise
+
+
+def is_http_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Welcome users and explain how to look up a movie."""
+    """Welcome users and explain how to find a movie."""
     message = update.effective_message
     if message is not None:
-        await message.reply_text(
-            "Kino kodini yuboring va men sizga uning videosi yoki havolasini yuboraman. "
-            "Yo‘riqnoma uchun /help buyrug‘idan foydalaning."
-        )
+        await message.reply_text("Salom! Kino kodi yoki nomini yuboring:")
 
 
-async def help_command(
+async def admin_panel(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Explain the supported movie code formats."""
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(
-            "Kino kodini yozma ravishda yuboring. Kodlar katta-kichik harflarga "
-            "farq qilmagan holda qidiriladi."
-        )
-
-
-async def add_movie(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin command to add a movie via private chat or group."""
+    """Show the admin menu to the configured admin."""
     message = update.effective_message
     user = update.effective_user
-    
     if message is None or user is None:
         return
 
-    # Check if user is admin
-    admin_id = os.getenv("ADMIN_ID")
-    if not admin_id or str(user.id) != str(admin_id):
-        await message.reply_text("Kechirasiz, bu buyruq faqat admin uchun!")
+    if user.id != ADMIN_ID:
+        await message.reply_text("Sizda bu buyruqdan foydalanish huquqi yo‘q!")
         return
 
-    args = context.args
-    if not args:
-        await message.reply_text(
-            "Xato format! Foydalanish:\n"
-            "1) Videoga izoh (caption) qilib yuborish: `/add 101`\n"
-            "2) Videoga javob (reply) qilib yuborish: `/add 101`\n"
-            "3) Havola uchun: `/add 101 https://t.me/...`",
-            parse_mode="Markdown"
+    keyboard = [
+        [InlineKeyboardButton("Statistika", callback_data="admin_stats")],
+        [
+            InlineKeyboardButton(
+                "Kino qo‘shish",
+                callback_data="admin_add_movie",
+            )
+        ],
+    ]
+    await message.reply_text(
+        "<b>Xush kelibsiz, admin!</b>\nKerakli amalni tanlang:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="HTML",
+    )
+
+
+async def admin_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle admin menu button selections."""
+    query = update.callback_query
+    if query is None:
+        return
+
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Siz admin emassiz!", show_alert=True)
+        return
+
+    await query.answer()
+    if query.data == "admin_stats":
+        try:
+            catalog = load_catalog()
+        except (OSError, ValueError):
+            await query.edit_message_text("Katalogni o‘qib bo‘lmadi.")
+            return
+        video_count = sum(
+            isinstance(movie, dict) and movie.get("type") == "video"
+            for movie in catalog.values()
         )
-        return
-
-    code = args[0].strip().upper()
-
-    # 1. Agar video bilan birga yuborilgan bo'lsa (caption orqali)
-    if message.video:
-        file_id = message.video.file_id
-        MOVIE_CATALOG[code] = {"type": "video", "file_id": file_id}
-        save_catalog(MOVIE_CATALOG)
-        await message.reply_text(f"Muvaffaqiyatli! `{code}` kodi uchun video saqlandi.", parse_mode="Markdown")
-        return
-
-    # 2. Agar mavjud videoga reply (javob) qilingan bo'lsa
-    if message.reply_to_message and message.reply_to_message.video:
-        file_id = message.reply_to_message.video.file_id
-        MOVIE_CATALOG[code] = {"type": "video", "file_id": file_id}
-        save_catalog(MOVIE_CATALOG)
-        await message.reply_text(f"Muvaffaqiyatli! `{code}` kodi uchun video saqlandi.", parse_mode="Markdown")
-        return
-
-    # 3. Agar havola berilgan bo'lsa
-    if len(args) < 2:
-        await message.reply_text("Iltimos, havola ham kiriting yoki videoga qo'shib yuboring!")
-        return
-
-    url = args[1].strip()
-    MOVIE_CATALOG[code] = {"type": "link", "url": url}
-    save_catalog(MOVIE_CATALOG)
-    await message.reply_text(f"Muvaffaqiyatli! `{code}` kodi uchun havola saqlandi.", parse_mode="Markdown")
+        link_count = len(catalog) - video_count
+        await query.edit_message_text(
+            f"Bot statistikasi:\n"
+            f"Jami kino: {len(catalog)}\n"
+            f"Video: {video_count}\n"
+            f"Havola: {link_count}"
+        )
+    elif query.data == "admin_add_movie":
+        context.user_data["awaiting_movie_add"] = True
+        context.user_data.pop("pending_movie_code", None)
+        await query.edit_message_text(
+            "Kino qo‘shish uchun:\n"
+            "• Videoni captioniga kino kodini yozib yuboring; yoki\n"
+            "• Kod va havolani yuboring: 101 https://example.com/video\n\n"
+            "Bekor qilish: /cancel"
+        )
 
 
 async def delete_movie(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Remove a movie code from the catalog. This does not delete Telegram media."""
+    """Delete a movie code from the catalog; Telegram media itself remains."""
     message = update.effective_message
     user = update.effective_user
-
     if message is None or user is None:
         return
 
-    admin_id = os.getenv("ADMIN_ID")
-    if not admin_id or str(user.id) != str(admin_id):
-        await message.reply_text("Kechirasiz, bu buyruq faqat admin uchun!")
+    if user.id != ADMIN_ID:
+        await message.reply_text("Bu buyruq faqat admin uchun.")
         return
 
-    args = context.args
-    if not args:
+    if not context.args or not context.args[0].strip():
         await message.reply_text("Foydalanish: /del 101")
         return
 
-    code = args[0].strip().upper()
-    if code not in MOVIE_CATALOG:
+    code = context.args[0].strip().upper()
+    try:
+        catalog = load_catalog()
+    except (OSError, ValueError):
+        logger.exception("Could not read catalog while deleting movie code")
+        await message.reply_text("Kino katalogini o‘qib bo‘lmadi.")
+        return
+
+    if code not in catalog:
         await message.reply_text(f"{code} kodi katalogda topilmadi.")
         return
 
-    del MOVIE_CATALOG[code]
-    save_catalog(MOVIE_CATALOG)
+    del catalog[code]
+    try:
+        save_catalog(catalog)
+    except OSError:
+        logger.exception("Could not save catalog after deleting movie code")
+        await message.reply_text("Kino kodini katalogdan o‘chirib bo‘lmadi.")
+        return
+
     await message.reply_text(
         f"{code} kodi katalogdan o‘chirildi. Telegramdagi asl video o‘chmaydi."
     )
 
 
-async def handle_movie_code(
+async def add_movie(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Look up a code and send its configured video or link."""
+    """Add a movie using /add CODE URL or a replied-to/uploaded video."""
     message = update.effective_message
-    if message is None or message.text is None:
+    user = update.effective_user
+    if message is None or user is None:
+        return
+    if user.id != ADMIN_ID:
+        await message.reply_text("Bu buyruq faqat admin uchun.")
+        return
+
+    args = context.args
+    if not args:
+        context.user_data["awaiting_movie_add"] = True
+        context.user_data.pop("pending_movie_code", None)
+        await message.reply_text(
+            "Video yuboring (captionida kod bo‘lsin) yoki "
+            "`kod https://havola` yozing. Bekor qilish: /cancel"
+        )
+        return
+
+    code = args[0].strip().upper()
+    video = message.video
+    if video is None and message.reply_to_message is not None:
+        video = message.reply_to_message.video
+
+    if video is not None:
+        await store_movie(
+            message,
+            code,
+            {"type": "video", "file_id": video.file_id},
+        )
+        return
+
+    if len(args) >= 2 and is_http_url(args[1]):
+        await store_movie(message, code, {"type": "link", "url": args[1]})
+        return
+
+    if len(args) == 1:
+        context.user_data["awaiting_movie_add"] = True
+        context.user_data["pending_movie_code"] = code
+        await message.reply_text(
+            f"{code} kodi tanlandi. Shu kodga video yuboring yoki "
+            "video havolasini jo‘nating. Bekor qilish: /cancel"
+        )
+        return
+
+    await message.reply_text(
+        "Foydalanish: /add 101 https://example.com/video "
+        "yoki videoga javob qilib /add 101 yuboring."
+    )
+
+
+async def store_movie(
+    message,
+    code: str,
+    movie: dict[str, str],
+) -> bool:
+    """Save one movie entry and report success or failure to the admin."""
+    try:
+        catalog = load_catalog()
+    except (OSError, ValueError):
+        await message.reply_text("Kino katalogini o‘qib bo‘lmadi.")
+        return False
+
+    catalog[code] = movie
+    try:
+        save_catalog(catalog)
+    except OSError:
+        await message.reply_text("Kinoni katalogga saqlab bo‘lmadi.")
+        return False
+
+    await message.reply_text(f"{code} kodi uchun kino saqlandi.")
+    return True
+
+
+async def cancel_add(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Cancel an in-progress movie addition."""
+    context.user_data.pop("awaiting_movie_add", None)
+    context.user_data.pop("pending_movie_code", None)
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text("Kino qo‘shish bekor qilindi.")
+
+
+async def handle_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Accept pending admin additions or look up a movie code."""
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return
+
+    if context.user_data.get("awaiting_movie_add") and user.id == ADMIN_ID:
+        code_from_command = context.user_data.get("pending_movie_code")
+        if message.video is not None:
+            code = message.caption.strip().upper() if message.caption else ""
+            code = code or (code_from_command or "")
+            if not code:
+                await message.reply_text(
+                    "Videoning captioniga kino kodini yozing yoki avval /add <kod> yuboring."
+                )
+                return
+            saved = await store_movie(
+                message,
+                code,
+                {"type": "video", "file_id": message.video.file_id},
+            )
+            if saved:
+                context.user_data.pop("awaiting_movie_add", None)
+                context.user_data.pop("pending_movie_code", None)
+            return
+
+        if message.text is None:
+            return
+
+        parts = message.text.strip().split(maxsplit=1)
+        if code_from_command:
+            code = code_from_command
+            url = parts[0] if parts else ""
+        elif len(parts) == 2:
+            code, url = parts[0].upper(), parts[1]
+        else:
+            await message.reply_text(
+                "Kod va havolani birga yuboring, masalan: "
+                "101 https://example.com/video"
+            )
+            return
+
+        if not is_http_url(url):
+            await message.reply_text("Havola http:// yoki https:// bilan boshlanishi kerak.")
+            return
+        saved = await store_movie(message, code, {"type": "link", "url": url})
+        if saved:
+            context.user_data.pop("awaiting_movie_add", None)
+            context.user_data.pop("pending_movie_code", None)
+        return
+
+    if message.text is None:
         return
 
     code = message.text.strip().upper()
-    movie = MOVIE_CATALOG.get(code)
-
-    if movie is None:
-        # Avoid replying to ordinary group chat, but explain missing numeric codes.
-        chat_type = message.chat.type if message.chat is not None else None
-        if chat_type == "private" or code.isdigit():
-            await message.reply_text(
-                "Bu kino kodi katalogda topilmadi. Admin uni "
-                "/add <kod> <havola> buyrug‘i bilan qo‘shishi mumkin."
-            )
+    try:
+        catalog = load_catalog()
+    except (OSError, ValueError):
+        logger.exception("Catalog file contains invalid JSON")
+        await message.reply_text("Kino katalogida xatolik bor. Admin bilan bog‘laning.")
         return
 
-    try:
-        movie_type = movie.get("type")
-        if movie_type == "link":
-            url = movie.get("url")
-            if not url:
-                return
-            await message.reply_text(url, disable_web_page_preview=False)
-        elif movie_type == "video":
-            file_id = movie.get("file_id")
-            if not file_id:
-                return
+    movie = catalog.get(code)
+    if movie is None:
+        await message.reply_text("Kechirasiz, bunday kodli kino topilmadi.")
+    elif isinstance(movie, dict) and movie.get("type") == "video":
+        file_id = movie.get("file_id")
+        if file_id:
             await message.reply_video(video=file_id, supports_streaming=True)
-    except TelegramError:
-        logger.exception("Telegram could not deliver a movie for code %s", code)
+        else:
+            await message.reply_text("Bu kino videosi katalogda noto‘g‘ri saqlangan.")
+    elif isinstance(movie, dict) and movie.get("type") == "link":
+        url = movie.get("url")
+        if url:
+            await message.reply_text(url, disable_web_page_preview=False)
+        else:
+            await message.reply_text("Bu kino havolasi katalogda noto‘g‘ri saqlangan.")
+    else:
+        # Older catalog entries stored the link as a plain string.
+        await message.reply_text(str(movie), disable_web_page_preview=False)
 
 
 def main() -> None:
-    """Configure and start the bot."""
+    """Configure and run the Telegram bot."""
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise SystemExit(
-            "BOT_TOKEN topilmadi. Replit Secrets'ga BOT_TOKEN nomli kalit qo‘shing."
-        )
+        raise SystemExit("Xatolik: Replit Secrets'da BOT_TOKEN topilmadi!")
+    if ADMIN_ID == 0:
+        logger.warning("ADMIN_ID sozlanmagan; admin panelidan foydalanib bo‘lmaydi.")
 
-    application = Application.builder().token(token).build()
+    application = ApplicationBuilder().token(token).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_panel))
     application.add_handler(CommandHandler("add", add_movie))
     application.add_handler(CommandHandler("del", delete_movie))
+    application.add_handler(CommandHandler("cancel", cancel_add))
+    application.add_handler(CallbackQueryHandler(admin_callback))
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_movie_code)
+        MessageHandler(
+            (filters.TEXT | filters.VIDEO) & ~filters.COMMAND,
+            handle_message,
+        )
     )
 
-    logger.info("Movie code bot is starting.")
+    logger.info("Bot ishga tushdi.")
     application.run_polling()
 
 
 if __name__ == "__main__":
     main()
-    
